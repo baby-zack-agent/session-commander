@@ -21,6 +21,9 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// Lemon Squeezy license API shapes verified live 2026-09-29 — see lib/license.js
+// (NOT the REST-API { data: { attributes } } shape)
+const { parseActivateResponse, parseValidateResponse } = require('../lib/license.js');
 
 const VERSION = '0.1.0';
 
@@ -512,9 +515,7 @@ async function cmdActivate(flags, positional) {
   console.log('activating license…');
   const res = await lsPost('/activate', { license_key: key, instance_name: instanceName() });
   if (res.networkError) die(`could not reach the license server (${LICENSE_API_BASE}).\ncheck your connection and try again — no changes made.`);
-  const attrs = res.body && res.body.data && res.body.data.attributes;
-  const instanceId = attrs && attrs.instance && attrs.instance.id;
-  const valid = attrs && (attrs.valid === true || !!instanceId);
+  const { valid, instanceId } = parseActivateResponse(res.body);
   if (!res.ok || !valid) {
     const detail = (res.body.errors && res.body.errors.map(e => e.detail).join('; ')) || 'license rejected';
     die(`activation failed: ${detail}`);
@@ -543,8 +544,8 @@ async function isPro() {
   // stale: try to revalidate; offline falls back to grace
   const res = await lsPost('/validate', { license_key: undefined, instance_id: lic.instanceId }).catch(() => ({ ok: false, networkError: true }));
   if (res.networkError) return { pro: true, offline: true, grace: true };
-  const attrs = res.body && res.body.data && res.body.data.attributes;
-  if (res.ok && attrs && attrs.valid !== false) {
+  // Lemon Squeezy license API shape: { valid, license_key: {...}, instance: { id }, meta }
+  if (res.ok && parseValidateResponse(res.body).valid) {
     lic.lastCheck = Date.now(); writeLicense(lic);
     return { pro: true };
   }

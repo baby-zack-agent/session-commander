@@ -183,3 +183,20 @@ test('every command answers --help', () => {
     assert.ok(r.stdout.length > 20, c);
   }
 });
+
+test('license API response shapes parse correctly (live shape, 2026-09-29)', () => {
+  const L = require('../lib/license.js');
+  // real /activate success shape
+  let r = L.parseActivateResponse({ activated: true, instance: { id: 'i-1' }, license_key: {} });
+  assert.equal(r.valid, true); assert.equal(r.instanceId, 'i-1');
+  // real /activate error shape
+  r = L.parseActivateResponse({ activated: false, error: 'No valid license key' });
+  assert.equal(r.valid, false);
+  // old (wrong) REST shape must NOT validate
+  r = L.parseActivateResponse({ data: { attributes: { valid: true } } });
+  assert.equal(r.valid, false);
+  // real /validate success shape
+  assert.equal(L.parseValidateResponse({ valid: true, instance: { id: 'i-2' } }).valid, true);
+  // real /validate failure shape
+  assert.equal(L.parseValidateResponse({ valid: false }).valid, false);
+});
