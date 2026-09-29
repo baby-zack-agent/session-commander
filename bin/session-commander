@@ -1,0 +1,738 @@
+#!/usr/bin/env node
+'use strict';
+/* session-commander: search, cost-track, and govern your coding-agent sessions.
+ *
+ * Local-only. Node stdlib only — zero dependencies, no telemetry.
+ * Free core is fully local. Pro commands require a license key and only
+ * contact the license server to activate/validate (see `activate --help`).
+ *
+ * Usage:
+ *   session-commander sessions [--days N] [--limit N] [--json]
+ *   session-commander search <query> [--limit N] [--context N]
+ *   session-commander cost [--project NAME] [--model NAME] [--days N]
+ *   session-commander snapshot [flags]          # save working state (free)
+ *   session-commander lint-rules [dir]          # lint agent rules files (free)
+ *   session-commander export --format csv|json|md [--project NAME] [--out FILE]   # Pro
+ *   session-commander report [--days N] [--out FILE]                              # Pro
+ *   session-commander sync-rules export [--out FILE] | import <file> [--dir DIR]  # Pro
+ *   session-commander activate <license-key> | deactivate | status
+ */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const VERSION = '0.1.0';
+
+// ---------------------------------------------------------------------------
+// Pricing: USD per 1M tokens, as of 2026-09-29. These are estimates baked in
+// for convenience — vendors change prices; verify before relying on exact
+// dollar figures. Unknown models fall back to the sonnet-4-5 band and are
+// marked as estimated.
+// ---------------------------------------------------------------------------
+const PRICING_DATE = '2026-09-29';
+const PRICING = {
+  'opus-4-1':  { input: 15,   output: 75 },
+  'opus-4-5':  { input: 15,   output: 75 },
+  'sonnet-4-5':{ input: 3,    output: 15 },
+  'sonnet-4':  { input: 3,    output: 15 },
+  'haiku-4-5': { input: 1,    output: 5 },
+  'haiku-4':   { input: 1,    output: 5 },
+  'gpt-5-mini':{ input: 0.25, output: 2 },
+  'gpt-5':     { input: 1.25, output: 10 },
+  'gpt-4o':    { input: 2.5,  output: 10 },
+  'o3':        { input: 2,    output: 8 },
+  'gemini-2.5-pro':  { input: 1.25, output: 10 },
+  'gemini-2.5-flash':{ input: 0.3,  output: 2.5 },
+  'grok-4':    { input: 3,    output: 15 },
+};
+const FALLBACK_RATE = { input: 3, output: 15, estimated: true };
+
+function rateFor(model) {
+  if (!model) return { ...FALLBACK_RATE };
+  const m = String(model).toLowerCase();
+  for (const k of Object.keys(PRICING)) {
+    if (m.includes(k)) return { ...PRICING[k], estimated: false };
+  }
+  return { ...FALLBACK_RATE };
+}
+
+// ---------------------------------------------------------------------------
+// License server wiring.
+// LICENSE_API_BASE is the ONE item that needs the store's product details:
+// point it at your Lemon Squeezy store's license endpoints. Defaults to the
+// public Lemon Squeezy license API format.
+// ---------------------------------------------------------------------------
+const LICENSE_API_BASE = process.env.SC_LICENSE_API || 'https://api.lemonsqueezy.com/v1/licenses';
+const OFFLINE_GRACE_DAYS = 14;
+
+const CONFIG_DIR = process.env.SC_CONFIG_DIR || path.join(os.homedir(), '.config', 'session-commander');
+const LICENSE_FILE = path.join(CONFIG_DIR, 'license.json');
+
+// ---------------------------------------------------------------------------
+// tiny utils
+// ---------------------------------------------------------------------------
+function warn(msg) { process.stderr.write(msg + '\n'); }
+function die(msg, code = 1) { warn(msg); process.exit(code); }
+function money(n) { return '$' + n.toFixed(2); }
+function num(n) { return Number(n || 0).toLocaleString('en-US'); }
+function isoDate(ts) { return new Date(ts).toISOString().slice(0, 10); }
+
+function walkJsonl(dir) {
+  const out = [];
+  let root;
+  try { root = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return out; }
+  for (const e of root) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...walkJsonl(p));
+    else if (e.isFile() && e.name.endsWith('.jsonl')) out.push(p);
+  }
+  return out;
+}
+
+function readJsonLines(file, maxBytes = 8 * 1024 * 1024) {
+  let text;
+  try {
+    const st = fs.statSync(file);
+    if (st.size > maxBytes) {
+      // tail the file: parse is best-effort on huge transcripts
+      const fd = fs.openSync(file, 'r');
+      const buf = Buffer.alloc(maxBytes);
+      fs.readSync(fd, buf, 0, maxBytes, Math.max(0, st.size - maxBytes));
+      fs.closeSync(fd);
+      text = buf.toString('utf8');
+    } else {
+      text = fs.readFileSync(file, 'utf8');
+    }
+  } catch { return []; }
+  const rows = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try { rows.push(JSON.parse(t)); } catch { /* skip corrupt lines */ }
+  }
+  return rows;
+}
+
+function textOfMessage(entry) {
+  // Claude Code transcript lines: {type, message:{role, content:[{type:'text',text}]}}
+  const msg = entry.message || entry;
+  const c = msg.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c.filter(b => b && (b.type === 'text' || typeof b.text === 'string'))
+      .map(b => b.text || '').join('\n');
+  }
+  return '';
+}
+
+// ---------------------------------------------------------------------------
+// arg parsing: command + --flag value / --flag=value / positional
+// ---------------------------------------------------------------------------
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  const cmd = args[0] && !args[0].startsWith('-') ? args.shift() : null;
+  const flags = {};
+  const positional = [];
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      if (eq > 0) { flags[a.slice(2, eq)] = a.slice(eq + 1); i++; }
+      else if (i + 1 < args.length && !args[i + 1].startsWith('-')) { flags[a.slice(2)] = args[i + 1]; i += 2; }
+      else { flags[a.slice(2)] = true; i++; }
+    } else if (a.startsWith('-') && a.length === 2) {
+      if (i + 1 < args.length && !args[i + 1].startsWith('-')) { flags[a.slice(1)] = args[i + 1]; i += 2; }
+      else { flags[a.slice(1)] = true; i++; }
+    } else { positional.push(a); i++; }
+  }
+  return { cmd, flags, positional };
+}
+
+// ---------------------------------------------------------------------------
+// session scanning
+// ---------------------------------------------------------------------------
+function claudeDir() { return process.env.SC_CLAUDE_DIR || path.join(os.homedir(), '.claude', 'projects'); }
+function codexDir() { return process.env.SC_CODEX_DIR || path.join(os.homedir(), '.codex', 'sessions'); }
+
+function parseSessionFile(file) {
+  const rows = readJsonLines(file);
+  const s = {
+    id: path.basename(file, '.jsonl'),
+    path: file,
+    project: path.basename(path.dirname(file)),
+    source: 'claude-code',
+    startedAt: null, endedAt: null,
+    messages: 0, userMsgs: 0, assistantMsgs: 0,
+    inputTokens: 0, outputTokens: 0, cacheCreate: 0, cacheRead: 0,
+    models: new Set(), cost: 0, costEstimated: false,
+  };
+  for (const r of rows) {
+    const t = r.type || (r.message && r.message.role);
+    if (t === 'user' || t === 'human') { s.messages++; s.userMsgs++; }
+    else if (t === 'assistant') { s.messages++; s.assistantMsgs++; }
+    else continue;
+    const ts = r.timestamp ? Date.parse(r.timestamp) : null;
+    if (ts && !Number.isNaN(ts)) {
+      if (!s.startedAt || ts < s.startedAt) s.startedAt = ts;
+      if (!s.endedAt || ts > s.endedAt) s.endedAt = ts;
+    }
+    const u = r.message && r.message.usage;
+    if (u && typeof u === 'object') {
+      const inp = u.input_tokens || 0, out = u.output_tokens || 0;
+      s.inputTokens += inp; s.outputTokens += out;
+      s.cacheCreate += u.cache_creation_input_tokens || 0;
+      s.cacheRead += u.cache_read_input_tokens || 0;
+      const model = r.message.model || r.model;
+      if (model) s.models.add(model);
+      const rate = rateFor(model);
+      if (rate.estimated) s.costEstimated = true;
+      s.cost += (inp / 1e6) * rate.input + (out / 1e6) * rate.output;
+    }
+  }
+  return s;
+}
+
+function scanSessions() {
+  const out = [];
+  const cdir = claudeDir();
+  const files = walkJsonl(cdir);
+  for (const f of files) {
+    const s = parseSessionFile(f);
+    if (s.messages > 0) out.push(s);
+  }
+  // Codex: best-effort. ~/.codex/sessions layout varies; parse jsonl if present.
+  const xdir = codexDir();
+  if (fs.existsSync(xdir)) {
+    const xfiles = walkJsonl(xdir);
+    let parsed = 0;
+    for (const f of xfiles) {
+      const s = parseSessionFile(f);
+      if (s.messages > 0) { s.source = 'codex'; out.push(s); parsed++; }
+    }
+    if (xfiles.length > 0 && parsed === 0) {
+      warn(`note: found ${xfiles.length} codex session file(s) but could not parse their format — skipped`);
+    }
+  }
+  out.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  return { sessions: out, claudeFound: files.length > 0, codexFound: fs.existsSync(xdir) };
+}
+
+function fmtSessionRow(s) {
+  const d = s.startedAt ? isoDate(s.startedAt) : 'unknown-date';
+  const models = [...s.models].slice(0, 2).join(',') || 'unknown-model';
+  const est = s.costEstimated ? '~' : '';
+  return `${d}  ${s.project.slice(0, 28).padEnd(28)}  msgs ${String(s.messages).padStart(5)}  tok ${num(s.inputTokens + s.outputTokens).padStart(10)}  ${est}${money(s.cost).padStart(8)}  ${models}  ${s.id.slice(0, 8)}`;
+}
+
+// ---------------------------------------------------------------------------
+// FREE commands
+// ---------------------------------------------------------------------------
+function cmdSessions(flags) {
+  const { sessions, claudeFound } = scanSessions();
+  if (!claudeFound && sessions.length === 0) {
+    warn('no session transcripts found.');
+    warn(`looked in: ${claudeDir()} (Claude Code) and ${codexDir()} (Codex)`);
+    return;
+  }
+  let list = sessions;
+  if (flags.days) {
+    const cut = Date.now() - Number(flags.days) * 864e5;
+    list = list.filter(s => (s.startedAt || 0) >= cut);
+  }
+  const limit = flags.limit ? Number(flags.limit) : 25;
+  list = list.slice(0, limit);
+  if (flags.json) { console.log(JSON.stringify(list.map(ser), null, 2)); return; }
+  const totalCost = sessions.reduce((a, s) => a + s.cost, 0);
+  console.log(`date        project                       msgs   tokens          cost  model     id`);
+  for (const s of list) console.log(fmtSessionRow(s));
+  console.log(`\n${sessions.length} sessions, ${money(totalCost)} estimated total (rates as of ${PRICING_DATE})`);
+}
+
+function ser(s) {
+  return {
+    id: s.id, project: s.project, source: s.source,
+    startedAt: s.startedAt ? new Date(s.startedAt).toISOString() : null,
+    messages: s.messages, userMessages: s.userMsgs, assistantMessages: s.assistantMsgs,
+    inputTokens: s.inputTokens, outputTokens: s.outputTokens,
+    cacheCreationTokens: s.cacheCreate, cacheReadTokens: s.cacheRead,
+    models: [...s.models], estimatedCostUsd: +s.cost.toFixed(4), costEstimated: s.costEstimated,
+  };
+}
+
+function cmdSearch(flags, positional) {
+  const q = (positional[0] || '').toLowerCase();
+  if (!q) die('usage: session-commander search <query> [--limit N] [--context N]');
+  const { sessions } = scanSessions();
+  if (sessions.length === 0) die('no session transcripts found.');
+  const limit = flags.limit ? Number(flags.limit) : 10;
+  const ctx = flags.context ? Number(flags.context) : 2;
+  let shown = 0;
+  for (const s of sessions) {
+    if (shown >= limit) break;
+    const rows = readJsonLines(s.path);
+    const hits = [];
+    rows.forEach((r, idx) => {
+      const t = textOfMessage(r);
+      if (t && t.toLowerCase().includes(q)) hits.push({ idx, text: t });
+    });
+    if (hits.length === 0) continue;
+    shown++;
+    console.log(`\n=== ${s.project} / ${s.id.slice(0, 12)} (${s.startedAt ? isoDate(s.startedAt) : '?'}) — ${hits.length} hit(s) ===`);
+    for (const h of hits.slice(0, 5)) {
+      const lines = h.text.split('\n');
+      const li = lines.findIndex(l => l.toLowerCase().includes(q));
+      const from = Math.max(0, li - ctx), to = Math.min(lines.length, li + ctx + 1);
+      for (let i = from; i < to; i++) {
+        const mark = i === li ? '>>' : '  ';
+        console.log(`${mark} ${lines[i].slice(0, 220)}`);
+      }
+      console.log('---');
+    }
+  }
+  if (shown === 0) console.log('no matches.');
+}
+
+function cmdCost(flags) {
+  const { sessions } = scanSessions();
+  if (sessions.length === 0) die('no session transcripts found.');
+  let list = sessions;
+  const days = flags.days ? Number(flags.days) : 30;
+  const cut = Date.now() - days * 864e5;
+  list = list.filter(s => (s.startedAt || 0) >= cut);
+  if (flags.project) list = list.filter(s => s.project.toLowerCase().includes(String(flags.project).toLowerCase()));
+  if (flags.model) list = list.filter(s => [...s.models].some(m => m.toLowerCase().includes(String(flags.model).toLowerCase())));
+  const byProject = {}, byModel = {}, byDay = {};
+  let totIn = 0, totOut = 0, totCost = 0;
+  for (const s of list) {
+    totIn += s.inputTokens; totOut += s.outputTokens; totCost += s.cost;
+    const bp = byProject[s.project] || (byProject[s.project] = { cost: 0, tokens: 0, n: 0 });
+    bp.cost += s.cost; bp.tokens += s.inputTokens + s.outputTokens; bp.n++;
+    for (const m of s.models) {
+      const bm = byModel[m] || (byModel[m] = { cost: 0, tokens: 0 });
+      bm.cost += s.cost / Math.max(1, s.models.size); bm.tokens += (s.inputTokens + s.outputTokens) / Math.max(1, s.models.size);
+    }
+    if (s.startedAt) {
+      const d = isoDate(s.startedAt);
+      const bd = byDay[d] || (byDay[d] = { cost: 0, n: 0 });
+      bd.cost += s.cost; bd.n++;
+    }
+  }
+  console.log(`cost breakdown — last ${days} days (${list.length} sessions)`);
+  console.log(`total: ${money(totCost)}  input ${num(totIn)}  output ${num(totOut)}  (rates as of ${PRICING_DATE}, estimates)`);
+  console.log('\nby project:');
+  for (const [p, v] of Object.entries(byProject).sort((a, b) => b[1].cost - a[1].cost).slice(0, 15))
+    console.log(`  ${money(v.cost).padStart(8)}  ${num(v.tokens).padStart(10)} tok  ${v.n} sess  ${p}`);
+  console.log('\nby model:');
+  for (const [m, v] of Object.entries(byModel).sort((a, b) => b[1].cost - a[1].cost).slice(0, 10))
+    console.log(`  ${money(v.cost).padStart(8)}  ${num(Math.round(v.tokens)).padStart(10)} tok  ${m}`);
+  console.log('\nby day:');
+  for (const [d, v] of Object.entries(byDay).sort().slice(-14))
+    console.log(`  ${d}  ${money(v.cost).padStart(8)}  ${v.n} sess`);
+}
+
+// --- snapshot: port of compaction-snapshotter core --------------------------
+const SNAP_TAIL_LINES = 40;
+function snapDir(base) {
+  const d = path.join(base || process.cwd(), '.claude', 'snapshots');
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+function utcStamp() {
+  return new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, 'Z');
+}
+function readHookStdin() {
+  if (process.stdin.isTTY) return null;
+  try {
+    const raw = fs.readFileSync(0, 'utf8');
+    if (!raw.trim()) return null;
+    const d = JSON.parse(raw);
+    return (d && typeof d === 'object') ? d : null;
+  } catch { return null; }
+}
+function tailLines(p, n = SNAP_TAIL_LINES) {
+  try {
+    const text = fs.readFileSync(p, 'utf8').split('\n');
+    return text.length > n ? text.slice(-n) : text;
+  } catch { return null; }
+}
+function progressOf(plan) {
+  const steps = (plan || '').split('\n').filter(l => /^\s*-\s*\[[ xX]\]/.test(l));
+  if (!steps.length) return null;
+  const done = steps.filter(l => /^\s*-\s*\[[xX]\]/.test(l)).length;
+  const rest = steps.filter(l => /^\s*-\s*\[ \]/.test(l)).map(l => l.trim());
+  return { done, total: steps.length, rest };
+}
+function cmdSnapshot(flags) {
+  const dir = snapDir(flags.dir);
+  const existing = fs.readdirSync(dir).filter(f => f.endsWith('-snapshot.md')).sort();
+  if (flags.latest || flags.restore) {
+    const n = flags.restore ? Number(flags.n || 1) : 0;
+    const f = existing[existing.length - 1 - n];
+    if (!f) die('no snapshots found.');
+    console.log(fs.readFileSync(path.join(dir, f), 'utf8'));
+    return;
+  }
+  const hook = readHookStdin();
+  let stateFile = '';
+  if (flags['state-file']) {
+    try { stateFile = fs.readFileSync(flags['state-file'], 'utf8'); } catch { warn(`warning: state file not readable: ${flags['state-file']}`); }
+  }
+  let tail = null;
+  const tpath = hook && hook.transcript_path;
+  if (tpath) tail = tailLines(tpath);
+  const plan = flags.plan || stateFile;
+  const sections = [];
+  const add = (title, body) => { if (body && String(body).trim()) sections.push(`## ${title}\n\n${String(body).trim()}\n`); };
+  add('Plan', plan);
+  add('Currently doing', flags.doing);
+  add('Up next', flags.next);
+  add('Open tasks / TODOs', flags.todos);
+  add('Key decisions', flags.decisions);
+  add('Approaches tried and ruled out', flags['ruled-out']);
+  add('Open questions', flags.questions);
+  add('Note', flags.note);
+  if (plan) {
+    let p = plan;
+    if (flags.done) {
+      p = p.split('\n').map(l => l.trim().toLowerCase() === String(flags.done).trim().toLowerCase() && /-\s*\[ \]/.test(l) ? l.replace('[ ]', '[x]') : l).join('\n');
+    }
+    const pr = progressOf(p);
+    if (pr) sections.push(`## Progress\n\n${pr.done} of ${pr.total} steps complete\n${pr.rest.map(r => `- ${r}`).join('\n')}\n`);
+  }
+  if (tail) sections.push(`## Recent activity (raw transcript tail)\n\n${'```'}\n${tail.join('\n').slice(-6000)}\n${'```'}\n`);
+  const body = `# Context snapshot\n\n- taken (UTC): ${utcStamp()}\n- cwd: ${process.cwd()}\n${hook && hook.session_id ? `- session: ${hook.session_id}\n` : ''}\n${sections.join('\n')}`;
+  if (sections.length === 0 && !flags['force-empty']) {
+    warn('nothing captured (no flags, no state file, no transcript tail) — no snapshot written. use --force-empty to write anyway.');
+    return;
+  }
+  // dedupe against newest
+  const newest = existing.length ? fs.readFileSync(path.join(dir, existing[existing.length - 1]), 'utf8') : null;
+  const stripTs = t => t.replace(/^- taken \(UTC\): .+$/m, '');
+  if (newest && stripTs(newest) === stripTs(body)) { warn('identical to newest snapshot — skipped.'); return; }
+  let name = `${utcStamp()}-snapshot.md`, i = 2;
+  while (fs.existsSync(path.join(dir, name))) name = `${utcStamp()}-${i++}-snapshot.md`;
+  fs.writeFileSync(path.join(dir, name), body);
+  // retention
+  const keep = flags.keep !== undefined ? Number(flags.keep) : 20;
+  if (keep > 0) {
+    const all = fs.readdirSync(dir).filter(f => f.endsWith('-snapshot.md')).sort();
+    for (const f of all.slice(0, Math.max(0, all.length - keep))) fs.unlinkSync(path.join(dir, f));
+  }
+  console.log(`snapshot written: ${path.join(dir, name)}`);
+}
+
+// --- lint-rules: port of rules-linter core ---------------------------------
+const RULES_FILES = ['MUSE.md', '.cursorrules', 'AGENTS.md', '.muserules', '.aiderules'];
+const VAGUE = [
+  [/write good code/i, 'name the standard instead, e.g. "match the existing module style"'],
+  [/follow best practices/i, 'name which practices, or link the doc'],
+  [/be careful/i, 'say what to be careful about'],
+  [/be mindful/i, 'say what to be mindful of'],
+  [/do your best/i, 'define what "best" means here'],
+  [/ensure quality/i, 'define the quality bar concretely'],
+];
+function cmdLintRules(flags, positional) {
+  const dir = path.resolve(positional[0] || '.');
+  const errs = [], warns = [], infos = [];
+  const found = RULES_FILES.filter(f => fs.existsSync(path.join(dir, f)));
+  if (found.length === 0) { console.log(`no rules files found in ${dir} (looked for ${RULES_FILES.join(', ')})`); return; }
+  const has = f => fs.existsSync(path.join(dir, f));
+  const read = f => { try { return fs.readFileSync(path.join(dir, f), 'utf8'); } catch { return ''; } };
+  for (const f of found) {
+    const text = read(f);
+    const lines = text.split('\n');
+    lines.forEach((line, idx) => {
+      const ln = `${f}:${idx + 1}`;
+      if (/use npm\b/i.test(line) && has('pnpm-lock.yaml')) errs.push(`[${ln}] says "use npm" but repo uses pnpm (pnpm-lock.yaml present)`);
+      if (/use pnpm\b/i.test(line) && has('package-lock.json') && !has('pnpm-lock.yaml')) errs.push(`[${ln}] says "use pnpm" but repo uses npm (package-lock.json present)`);
+      const py = line.match(/python\s*(\d+)\.(\d+)/i);
+      if (py && has('pyproject.toml')) {
+        const req = read('pyproject.toml');
+        const m = req.match(/requires-python\s*=\s*["']>=?\s*(\d+)\.(\d+)/);
+        if (m && (Number(m[1]) > Number(py[1]) || (Number(m[1]) === Number(py[1]) && Number(m[2]) > Number(py[2]))))
+          errs.push(`[${ln}] pins Python ${py[1]}.${py[2]} but pyproject.toml requires >=${m[1]}.${m[2]}`);
+      }
+      const nv = line.match(/node\s*(?:v?(\d+))/i);
+      if (nv && has('.nvmrc')) {
+        const want = read('.nvmrc').trim().replace(/^v/, '');
+        if (want && !want.startsWith(nv[1])) errs.push(`[${ln}] pins Node ${nv[1]} but .nvmrc says ${want}`);
+      }
+      if (/\brun make\b|\buse make\b/i.test(line) && !has('Makefile')) errs.push(`[${ln}] says "run make" but there is no Makefile`);
+      for (const [re, sug] of VAGUE) if (re.test(line)) warns.push(`[${ln}] vague rule: "${line.trim().slice(0, 60)}" — ${sug}`);
+      for (const m of line.matchAll(/`([^`]+)`/g)) {
+        const p = m[1].replace(/\/$/, '');
+        if (/^[\w.\-/]+$/.test(p) && !has(p)) infos.push(`[${ln}] references \`${m[1]}\` which does not exist`);
+      }
+      if (/git (flow|workflow|commit|branch)/i.test(line) && !has('.git')) infos.push(`[${ln}] describes a git workflow but there is no .git directory`);
+    });
+  }
+  const print = (title, arr) => { if (arr.length) { console.log(`\n${title} (${arr.length})`); for (const a of arr) console.log('  ' + a); } };
+  console.log(`session-commander lint-rules ${VERSION} — ${dir}`);
+  console.log(`rules files: ${found.join(', ')}`);
+  print('ERRORS', errs); print('WARNINGS', warns); print('INFOS', infos);
+  console.log(`\n${errs.length} error${errs.length === 1 ? '' : 's'}, ${warns.length} warning${warns.length === 1 ? '' : 's'}, ${infos.length} info`);
+  if (errs.length) process.exitCode = 1;
+}
+
+// ---------------------------------------------------------------------------
+// License (Pro) handling
+// ---------------------------------------------------------------------------
+function readLicense() {
+  try { return JSON.parse(fs.readFileSync(LICENSE_FILE, 'utf8')); } catch { return null; }
+}
+function writeLicense(d) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(LICENSE_FILE, JSON.stringify(d, null, 2));
+  try { fs.chmodSync(LICENSE_FILE, 0o600); } catch { /* windows */ }
+}
+async function lsPost(endpoint, payload, timeoutMs = 10000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(LICENSE_API_BASE + endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/vnd.api+json' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    const body = await r.json().catch(() => ({}));
+    return { ok: r.ok, body };
+  } catch (e) {
+    return { ok: false, networkError: true, error: String(e && e.message || e) };
+  } finally { clearTimeout(t); }
+}
+function instanceName() { return `${os.hostname()}-${os.userInfo().username || 'user'}`.slice(0, 60); }
+
+async function cmdActivate(flags, positional) {
+  const key = positional[0];
+  if (!key) die('usage: session-commander activate <license-key>');
+  console.log('activating license…');
+  const res = await lsPost('/activate', { license_key: key, instance_name: instanceName() });
+  if (res.networkError) die(`could not reach the license server (${LICENSE_API_BASE}).\ncheck your connection and try again — no changes made.`);
+  const attrs = res.body && res.body.data && res.body.data.attributes;
+  const instanceId = attrs && attrs.instance && attrs.instance.id;
+  const valid = attrs && (attrs.valid === true || !!instanceId);
+  if (!res.ok || !valid) {
+    const detail = (res.body.errors && res.body.errors.map(e => e.detail).join('; ')) || 'license rejected';
+    die(`activation failed: ${detail}`);
+  }
+  writeLicense({
+    keyFingerprint: key.slice(0, 4) + '…' + key.slice(-4),
+    instanceId, activatedAt: new Date().toISOString(),
+    lastCheck: Date.now(), apiBase: LICENSE_API_BASE,
+  });
+  console.log('Pro activated. export, report, and sync-rules are unlocked on this machine.');
+}
+
+async function cmdDeactivate() {
+  const lic = readLicense();
+  if (!lic) { console.log('no active license on this machine.'); return; }
+  warn('note: this only removes the local activation. Manage the license itself in your Lemon Squeezy account.');
+  try { fs.unlinkSync(LICENSE_FILE); } catch { /* already gone */ }
+  console.log('Pro deactivated on this machine.');
+}
+
+async function isPro() {
+  const lic = readLicense();
+  if (!lic || !lic.instanceId) return { pro: false };
+  const ageMs = Date.now() - (lic.lastCheck || 0);
+  if (ageMs < OFFLINE_GRACE_DAYS * 864e5) return { pro: true, offline: ageMs > 864e5 };
+  // stale: try to revalidate; offline falls back to grace
+  const res = await lsPost('/validate', { license_key: undefined, instance_id: lic.instanceId }).catch(() => ({ ok: false, networkError: true }));
+  if (res.networkError) return { pro: true, offline: true, grace: true };
+  const attrs = res.body && res.body.data && res.body.data.attributes;
+  if (res.ok && attrs && attrs.valid !== false) {
+    lic.lastCheck = Date.now(); writeLicense(lic);
+    return { pro: true };
+  }
+  return { pro: false };
+}
+
+async function requirePro() {
+  const st = await isPro();
+  if (!st.pro) {
+    die('this is a Pro command. Run `session-commander activate <license-key>` to unlock it,\nor `session-commander status` to check your license.');
+  }
+  if (st.offline) warn('note: license server unreachable — continuing under offline grace.');
+  return st;
+}
+
+async function cmdStatus() {
+  const lic = readLicense();
+  if (!lic) { console.log('plan: Free\nPro commands are locked. `session-commander activate <license-key>` to unlock.'); return; }
+  const st = await isPro();
+  console.log(`plan: ${st.pro ? 'Pro (active)' : 'Free (license invalid)'}`);
+  console.log(`instance: ${lic.instanceId}`);
+  console.log(`key: ${lic.keyFingerprint}`);
+  console.log(`activated: ${lic.activatedAt}`);
+  console.log(`last validated: ${new Date(lic.lastCheck).toISOString()}${st.offline ? ' (offline grace)' : ''}`);
+}
+
+// ---------------------------------------------------------------------------
+// PRO commands
+// ---------------------------------------------------------------------------
+async function cmdExport(flags) {
+  await requirePro();
+  const fmt = String(flags.format || 'md').toLowerCase();
+  if (!['csv', 'json', 'md'].includes(fmt)) die('usage: session-commander export --format csv|json|md [--project NAME] [--out FILE]');
+  const { sessions } = scanSessions();
+  let list = sessions;
+  if (flags.project) list = list.filter(s => s.project.toLowerCase().includes(String(flags.project).toLowerCase()));
+  let out;
+  if (fmt === 'json') out = JSON.stringify(list.map(ser), null, 2);
+  else if (fmt === 'csv') {
+    const rows = [['date', 'project', 'source', 'messages', 'input_tokens', 'output_tokens', 'cost_usd', 'models', 'id']];
+    for (const s of list) rows.push([s.startedAt ? isoDate(s.startedAt) : '', s.project, s.source, s.messages, s.inputTokens, s.outputTokens, s.cost.toFixed(4), [...s.models].join('|'), s.id]);
+    out = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+  } else {
+    out = `# Session Commander export — ${new Date().toISOString().slice(0, 10)}\n\n| date | project | msgs | tokens | cost | models |\n|---|---|---|---|---|---|\n` +
+      list.map(s => `| ${s.startedAt ? isoDate(s.startedAt) : ''} | ${s.project} | ${s.messages} | ${num(s.inputTokens + s.outputTokens)} | ${money(s.cost)} | ${[...s.models].join(', ')} |`).join('\n') +
+      `\n\n${list.length} sessions. Rates as of ${PRICING_DATE} (estimates).`;
+  }
+  if (flags.out) { fs.writeFileSync(flags.out, out); console.log(`wrote ${list.length} sessions to ${flags.out}`); }
+  else console.log(out);
+}
+
+async function cmdReport(flags) {
+  await requirePro();
+  const days = flags.days ? Number(flags.days) : 30;
+  const { sessions } = scanSessions();
+  const cut = Date.now() - days * 864e5;
+  const list = sessions.filter(s => (s.startedAt || 0) >= cut);
+  const totCost = list.reduce((a, s) => a + s.cost, 0);
+  const totTok = list.reduce((a, s) => a + s.inputTokens + s.outputTokens, 0);
+  const byDay = {};
+  for (const s of list) { const d = s.startedAt ? isoDate(s.startedAt) : 'unknown'; (byDay[d] = byDay[d] || { cost: 0, n: 0 }); byDay[d].cost += s.cost; byDay[d].n++; }
+  const dayKeys = Object.keys(byDay).sort();
+  const avgDaily = dayKeys.length ? totCost / dayKeys.length : 0;
+  const trend = dayKeys.length >= 2
+    ? (() => { const h1 = dayKeys.slice(0, Math.floor(dayKeys.length / 2)), h2 = dayKeys.slice(Math.floor(dayKeys.length / 2));
+      const c = ks => ks.reduce((a, k) => a + byDay[k].cost, 0) / Math.max(1, ks.length);
+      const d = c(h2) - c(h1); return d > 0.01 ? `up ${money(d)}/day vs first half` : d < -0.01 ? `down ${money(-d)}/day vs first half` : 'flat'; })()
+    : 'not enough data';
+  const top = [...list].sort((a, b) => b.cost - a.cost).slice(0, 5);
+  const byModel = {};
+  for (const s of list) for (const m of s.models) { const b = byModel[m] || (byModel[m] = 0); byModel[m] = b + s.cost / Math.max(1, s.models.size); }
+  const byProj = {};
+  for (const s of list) { const b = byProj[s.project] || (byProj[s.project] = 0); byProj[s.project] = b + s.cost; }
+  const rep = `# Session Commander report — last ${days} days\n\ngenerated: ${new Date().toISOString()}\n\n## Spend\n\n- total: **${money(totCost)}** across ${list.length} sessions (${num(totTok)} tokens)\n- avg/day: ${money(avgDaily)}\n- trend: ${trend}\n\n## Most expensive sessions\n\n${top.map((s, i) => `${i + 1}. ${money(s.cost)} — ${s.project} (${s.startedAt ? isoDate(s.startedAt) : '?'}, ${s.messages} msgs)`).join('\n') || 'none'}\n\n## Per-model split\n\n${Object.entries(byModel).sort((a, b) => b[1] - a[1]).map(([m, c]) => `- ${m}: ${money(c)} (${(c / Math.max(1e-9, totCost) * 100).toFixed(1)}%)`).join('\n') || 'none'}\n\n## Top projects\n\n${Object.entries(byProj).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([p, c]) => `- ${p}: ${money(c)}`).join('\n') || 'none'}\n\n_rates as of ${PRICING_DATE}; all figures are estimates._\n`;
+  if (flags.out) { fs.writeFileSync(flags.out, rep); console.log(`report written to ${flags.out}`); }
+  else console.log(rep);
+}
+
+async function cmdSyncRules(flags, positional) {
+  await requirePro();
+  const sub = positional[0];
+  if (sub === 'export') {
+    const dir = path.resolve(flags.dir || '.');
+    const bundle = { tool: 'session-commander', version: VERSION, exportedAt: new Date().toISOString(), files: {} };
+    for (const f of RULES_FILES) {
+      const p = path.join(dir, f);
+      if (fs.existsSync(p)) bundle.files[f] = fs.readFileSync(p, 'utf8');
+    }
+    const out = JSON.stringify(bundle, null, 2);
+    if (flags.out) { fs.writeFileSync(flags.out, out); console.log(`exported ${Object.keys(bundle.files).length} rules file(s) to ${flags.out}`); }
+    else console.log(out);
+  } else if (sub === 'import') {
+    const file = positional[1];
+    if (!file) die('usage: session-commander sync-rules import <bundle.json> [--dir DIR]');
+    const dir = path.resolve(flags.dir || '.');
+    let bundle;
+    try { bundle = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { die(`cannot read bundle: ${file}`); }
+    if (!bundle.files || typeof bundle.files !== 'object') die('invalid bundle: no files object');
+    let n = 0;
+    for (const [name, content] of Object.entries(bundle.files)) {
+      const target = path.join(dir, path.basename(name));
+      if (fs.existsSync(target)) {
+        const cur = fs.readFileSync(target, 'utf8');
+        if (cur === content) { console.log(`unchanged: ${name}`); continue; }
+        fs.writeFileSync(target + '.bak', cur);
+        console.log(`backed up existing ${name} -> ${name}.bak`);
+      }
+      fs.writeFileSync(target, content);
+      console.log(`imported: ${name}`);
+      n++;
+    }
+    console.log(`${n} file(s) imported.`);
+  } else {
+    die('usage: session-commander sync-rules export [--out FILE] | import <bundle.json> [--dir DIR]');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// help + dispatch
+// ---------------------------------------------------------------------------
+const HELP = {
+  main: `session-commander ${VERSION} — search, cost-track, and govern your coding-agent sessions.
+Local-only, zero dependencies, no telemetry.
+
+FREE
+  sessions [--days N] [--limit N] [--json]   list parsed sessions w/ cost
+  search <query> [--limit N] [--context N]   full-text search across transcripts
+  cost [--project NAME] [--model NAME] [--days N]
+                                             token/cost breakdowns
+  snapshot [flags]                           save working state (PreCompact hook friendly)
+  lint-rules [dir]                            lint agent rules files vs the repo
+
+PRO (license required)
+  export --format csv|json|md [--project NAME] [--out FILE]
+  report [--days N] [--out FILE]
+  sync-rules export [--out FILE] | import <bundle.json> [--dir DIR]
+
+LICENSE
+  activate <license-key>   unlock Pro on this machine
+  deactivate                 remove the local activation
+  status                     show license state
+
+Run \`session-commander <command> --help\` for details.`,
+  snapshot: `session-commander snapshot — save working state before context compaction.
+
+Flags: --plan --doing --next --todos --decisions --ruled-out --questions --note
+       --done "step text" --state-file PATH --dir DIR --keep N --force-empty
+       --latest | --restore [--n 1]
+Writes <dir>/.claude/snapshots/<utc>-snapshot.md. Wire to Claude Code's
+PreCompact hook and pipe the hook JSON on stdin for automatic transcript-tail
+capture.`,
+  search: `session-commander search <query> [--limit N] [--context N]
+Searches message text across all parsed session transcripts.`,
+  cost: `session-commander cost [--project NAME] [--model NAME] [--days N]
+Breakdowns per project / model / day. Rates as of ${PRICING_DATE} (estimates).`,
+  sessions: `session-commander sessions [--days N] [--limit N] [--json]`,
+  'lint-rules': `session-commander lint-rules [dir] — lint MUSE.md/.cursorrules/AGENTS.md vs the repo. Exit 1 on contradictions.`,
+  export: `session-commander export --format csv|json|md [--project NAME] [--out FILE]  (Pro)`,
+  report: `session-commander report [--days N] [--out FILE]  (Pro)`,
+  'sync-rules': `session-commander sync-rules export [--out FILE] | import <bundle.json> [--dir DIR]  (Pro)`,
+  activate: `session-commander activate <license-key>
+Contacts the license server once (${LICENSE_API_BASE}/activate) and caches the
+activation locally. Revalidation happens at most every ${OFFLINE_GRACE_DAYS} days; if the
+server is unreachable you keep working under offline grace. Only the key and a
+machine name leave your computer.`,
+};
+
+async function main() {
+  const { cmd, flags, positional } = parseArgs(process.argv);
+  if (!cmd || cmd === 'help' || flags.help || flags.h) {
+    if (cmd && HELP[cmd] && cmd !== 'help') console.log(HELP[cmd]);
+    else console.log(HELP.main);
+    return;
+  }
+  if (cmd === 'version' || flags.version || flags.v) { console.log(VERSION); return; }
+  switch (cmd) {
+    case 'sessions': return cmdSessions(flags);
+    case 'search': return cmdSearch(flags, positional);
+    case 'cost': return cmdCost(flags);
+    case 'snapshot': return cmdSnapshot(flags);
+    case 'lint-rules': return cmdLintRules(flags, positional);
+    case 'export': return cmdExport(flags);
+    case 'report': return cmdReport(flags);
+    case 'sync-rules': return cmdSyncRules(flags, positional);
+    case 'activate': return cmdActivate(flags, positional);
+    case 'deactivate': return cmdDeactivate();
+    case 'status': return cmdStatus();
+    default: die(`unknown command: ${cmd}\n\n${HELP.main}`, 2);
+  }
+}
+main().catch(e => die(`error: ${e && e.message || e}`));

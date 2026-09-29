@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-09-27T09:00:00.000Z","message":{"role":"user","content":"debug the billing webhook handler"}}
+{"type":"assistant","timestamp":"2026-09-27T09:00:10.000Z","message":{"role":"assistant","model":"claude-opus-4-1","content":[{"type":"text","text":"Looking at the billing webhook now."}],"usage":{"input_tokens":8000,"output_tokens":400}}}
