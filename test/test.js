@@ -126,7 +126,7 @@ test('lint-rules clean dir exits 0', () => {
 function activatePro() {
   fs.mkdirSync(config, { recursive: true });
   fs.writeFileSync(path.join(config, 'license.json'), JSON.stringify({
-    keyFingerprint: 'test…key', instanceId: 'inst-test',
+    key: 'test…key', keyFingerprint: 'test…key', instanceId: 'inst-test',
     activatedAt: new Date().toISOString(), lastCheck: Date.now(), apiBase: 'x',
   }));
 }
@@ -199,4 +199,7 @@ test('license API response shapes parse correctly (live shape, 2026-09-29)', () 
   assert.equal(L.parseValidateResponse({ valid: true, instance: { id: 'i-2' } }).valid, true);
   // real /validate failure shape
   assert.equal(L.parseValidateResponse({ valid: false }).valid, false);
+  // real /deactivate shape
+  assert.equal(L.parseDeactivateResponse({ deactivated: true }).deactivated, true);
+  assert.equal(L.parseDeactivateResponse({ deactivated: false, error: 'No valid instance' }).deactivated, false);
 });

@@ -23,7 +23,7 @@ const path = require('path');
 const os = require('os');
 // Lemon Squeezy license API shapes verified live 2026-09-29 — see lib/license.js
 // (NOT the REST-API { data: { attributes } } shape)
-const { parseActivateResponse, parseValidateResponse } = require('../lib/license.js');
+const { parseActivateResponse, parseValidateResponse, parseDeactivateResponse } = require('../lib/license.js');
 
 const VERSION = '0.1.0';
 
@@ -521,6 +521,7 @@ async function cmdActivate(flags, positional) {
     die(`activation failed: ${detail}`);
   }
   writeLicense({
+    key, // full key kept locally (0600 perms) so deactivate/validate can talk to the license server
     keyFingerprint: key.slice(0, 4) + '…' + key.slice(-4),
     instanceId, activatedAt: new Date().toISOString(),
     lastCheck: Date.now(), apiBase: LICENSE_API_BASE,
@@ -531,9 +532,18 @@ async function cmdActivate(flags, positional) {
 async function cmdDeactivate() {
   const lic = readLicense();
   if (!lic) { console.log('no active license on this machine.'); return; }
-  warn('note: this only removes the local activation. Manage the license itself in your Lemon Squeezy account.');
+  // free the activation slot server-side, then drop the local record
+  if (lic.key && lic.instanceId) {
+    console.log('releasing the activation with the license server…');
+    const res = await lsPost('/deactivate', { license_key: lic.key, instance_id: lic.instanceId }).catch(() => ({ ok: false, networkError: true }));
+    if (res.networkError) die('could not reach the license server — local activation left in place, try again when online.');
+    if (!res.ok || !parseDeactivateResponse(res.body).deactivated) {
+      const detail = (res.body && res.body.error) || 'deactivation rejected';
+      die(`server would not release the activation (${detail}) — local activation left in place.`);
+    }
+  }
   try { fs.unlinkSync(LICENSE_FILE); } catch { /* already gone */ }
-  console.log('Pro deactivated on this machine.');
+  console.log('Pro deactivated on this machine. The activation slot is now free.');
 }
 
 async function isPro() {
@@ -542,7 +552,9 @@ async function isPro() {
   const ageMs = Date.now() - (lic.lastCheck || 0);
   if (ageMs < OFFLINE_GRACE_DAYS * 864e5) return { pro: true, offline: ageMs > 864e5 };
   // stale: try to revalidate; offline falls back to grace
-  const res = await lsPost('/validate', { license_key: undefined, instance_id: lic.instanceId }).catch(() => ({ ok: false, networkError: true }));
+  // (licenses activated before the full key was stored can't revalidate server-side — keep grace)
+  if (!lic.key) return { pro: true, offline: true, grace: true };
+  const res = await lsPost('/validate', { license_key: lic.key, instance_id: lic.instanceId }).catch(() => ({ ok: false, networkError: true }));
   if (res.networkError) return { pro: true, offline: true, grace: true };
   // Lemon Squeezy license API shape: { valid, license_key: {...}, instance: { id }, meta }
   if (res.ok && parseValidateResponse(res.body).valid) {
